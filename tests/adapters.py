@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from collections import defaultdict
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import regex as re
 
 
 def run_linear(
@@ -589,4 +591,80 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    GPT2_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    with open(input_path, "rb") as f:
+        text = f.read().decode("utf-8", errors="ignore")
+
+    # Split on special tokens so their bytes are never merged together, then
+    # pre-tokenize each segment with the GPT-2 regex and count word frequencies.
+    word_freq: dict[tuple[int, ...], int] = defaultdict(int)
+    if special_tokens:
+        split_pattern = "(" + "|".join(re.escape(t) for t in special_tokens) + ")"
+        segments = re.split(split_pattern, text)
+    else:
+        segments = [text]
+    special_set = set(special_tokens)
+    for segment in segments:
+        if segment in special_set:
+            continue
+        for word in re.findall(GPT2_PATTERN, segment):
+            word_freq[tuple(word.encode("utf-8"))] += 1
+
+    vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
+    num_merges = vocab_size - 256 - len(special_tokens)
+
+    word_tokens = [list(w) for w in word_freq.keys()]
+    freqs = list(word_freq.values())
+
+    # Build initial pair counts and reverse index (pair -> set of word indices)
+    pair_counts: dict[tuple[int, int], int] = defaultdict(int)
+    pair_to_words: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for j, (tokens, freq) in enumerate(zip(word_tokens, freqs)):
+        for a, b in zip(tokens, tokens[1:]):
+            pair_counts[(a, b)] += freq
+            pair_to_words[(a, b)].add(j)
+
+    merges_list: list[tuple[bytes, bytes]] = []
+
+    for i in range(num_merges):
+        if not pair_counts:
+            break
+
+        best_pair = max(pair_counts, key=lambda p: (pair_counts[p], (vocab[p[0]], vocab[p[1]])))
+        new_id = 256 + i
+        vocab[new_id] = vocab[best_pair[0]] + vocab[best_pair[1]]
+        merges_list.append((vocab[best_pair[0]], vocab[best_pair[1]]))
+
+        # Only update words that contain best_pair
+        affected = pair_to_words.pop(best_pair, set())
+        for j in affected:
+            tokens = word_tokens[j]
+            freq = freqs[j]
+            # Remove old pair contributions for this word
+            for a, b in zip(tokens, tokens[1:]):
+                pair_counts[(a, b)] -= freq
+                pair_to_words[(a, b)].discard(j)
+                if pair_counts[(a, b)] == 0:
+                    del pair_counts[(a, b)]
+            # Apply merge
+            new_tokens: list[int] = []
+            k = 0
+            while k < len(tokens):
+                if k + 1 < len(tokens) and tokens[k] == best_pair[0] and tokens[k + 1] == best_pair[1]:
+                    new_tokens.append(new_id)
+                    k += 2
+                else:
+                    new_tokens.append(tokens[k])
+                    k += 1
+            word_tokens[j] = new_tokens
+            # Add new pair contributions for this word
+            for a, b in zip(new_tokens, new_tokens[1:]):
+                pair_counts[(a, b)] += freq
+                pair_to_words[(a, b)].add(j)
+
+    # Add special tokens at the end of the vocab
+    for i, token in enumerate(special_tokens):
+        vocab[256 + num_merges + i] = token.encode("utf-8")
+
+    return vocab, merges_list
