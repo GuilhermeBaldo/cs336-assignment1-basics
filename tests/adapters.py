@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterable
 from collections import defaultdict
 from typing import IO, Any, BinaryIO
+from abc import ABC, abstractmethod
 
 import numpy.typing as npt
 import torch
@@ -541,6 +542,74 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+class Tokenizer:
+    _GPT2_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
+        if special_tokens is None:
+            special_tokens = []
+        self._vocab = vocab
+        self._merges = merges
+        self._special_tokens = special_tokens
+
+        # Reverse vocab: bytes -> token_id
+        self._bytes_to_id: dict[bytes, int] = {v: k for k, v in vocab.items()}
+
+        # Merge rank: (bytes1, bytes2) -> rank (lower rank = applied first)
+        self._merge_rank: dict[tuple[bytes, bytes], int] = {
+            pair: rank for rank, pair in enumerate(merges)
+        }
+
+        # Regex to split on special tokens (longest first for greedy overlap handling)
+        sorted_specials = sorted(special_tokens, key=len, reverse=True)
+        if sorted_specials:
+            self._split_re: re.Pattern | None = re.compile(
+                "(" + "|".join(re.escape(t) for t in sorted_specials) + ")"
+            )
+        else:
+            self._split_re = None
+        self._special_set = set(special_tokens)
+
+    def _encode_word(self, word_bytes: bytes) -> list[int]:
+        """BPE-encode a single pre-tokenized word (given as raw bytes)."""
+        if not word_bytes:
+            return []
+        ids = [self._bytes_to_id[bytes([b])] for b in word_bytes]
+        while len(ids) >= 2:
+            best_rank = float("inf")
+            best_idx = -1
+            for i in range(len(ids) - 1):
+                rank = self._merge_rank.get((self._vocab[ids[i]], self._vocab[ids[i + 1]]), float("inf"))
+                if rank < best_rank:
+                    best_rank = rank
+                    best_idx = i
+            if best_idx == -1:
+                break
+            merged = self._vocab[ids[best_idx]] + self._vocab[ids[best_idx + 1]]
+            ids = ids[:best_idx] + [self._bytes_to_id[merged]] + ids[best_idx + 2:]
+        return ids
+
+    def encode(self, text: str) -> list[int]:
+        ids: list[int] = []
+        parts = self._split_re.split(text) if self._split_re else [text]
+        for part in parts:
+            if not part:
+                continue
+            if part in self._special_set:
+                ids.append(self._bytes_to_id[part.encode("utf-8")])
+            else:
+                for word in re.findall(self._GPT2_PATTERN, part):
+                    ids.extend(self._encode_word(word.encode("utf-8")))
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        return b"".join(self._vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        for chunk in iterable:
+            yield from self.encode(chunk)
+
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -561,7 +630,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
